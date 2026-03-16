@@ -17,6 +17,7 @@ from .groups.common import GroupCommon
 from .groups.hardwareinputoutput import GroupHardwareInputOutput
 from .groups.mediaprocessing import GroupMediaprocessing
 from .groups.misc import GroupMisc
+from .groups.payment import GroupPayment
 from .groups.share import GroupShare
 from .groups.uisettings import GroupUiSettings
 
@@ -50,3 +51,4 @@ class AppConfig(BaseConfig):
     backends: GroupCameras = GroupCameras()
     hardwareinputoutput: GroupHardwareInputOutput = GroupHardwareInputOutput()
     misc: GroupMisc = GroupMisc()
+    payment: GroupPayment = GroupPayment()
