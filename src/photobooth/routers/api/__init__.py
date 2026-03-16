@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from . import acquisition, actions, config, debug, filter, mediacollection, processing, share, sse, system
+from . import acquisition, actions, config, debug, filter, mediacollection, payment, processing, share, sse, system
 
 __all__ = [
     "actions",
@@ -10,6 +10,7 @@ __all__ = [
     "config",  # refers to the 'config.py' file
     "debug",
     "mediacollection",
+    "payment",
     "processing",
     "filter",
     "share",
@@ -23,6 +24,7 @@ router.include_router(acquisition.router)
 router.include_router(config.router)
 router.include_router(debug.router)
 router.include_router(mediacollection.router)
+router.include_router(payment.router)
 router.include_router(processing.router)
 router.include_router(filter.router)
 router.include_router(share.router)
