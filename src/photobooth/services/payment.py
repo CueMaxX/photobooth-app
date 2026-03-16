@@ -51,6 +51,7 @@ class SumUpPaymentService:
 
     def __init__(self):
         self._current_checkout_id: str | None = None
+        self._payment_confirmed: bool = False
 
     def _get_api_key(self) -> str:
         """Retrieve the API key from config (SecretStr)."""
@@ -328,6 +329,29 @@ class SumUpPaymentService:
     def has_active_checkout(self) -> bool:
         """Check if there is a currently active (pending) checkout."""
         return self._current_checkout_id is not None
+
+    def set_payment_confirmed(self):
+        """Mark that a payment was successfully completed. Used as a one-time token."""
+        self._payment_confirmed = True
+        logger.info("Payment confirmation flag set")
+
+    def consume_payment_confirmation(self) -> bool:
+        """Check and consume the payment confirmation (one-time use).
+        Returns True if a payment was confirmed, then resets the flag."""
+        if self._payment_confirmed:
+            self._payment_confirmed = False
+            logger.info("Payment confirmation consumed")
+            return True
+        return False
+
+    @property
+    def is_payment_confirmed(self) -> bool:
+        """Check if a payment has been confirmed (without consuming it)."""
+        return self._payment_confirmed
+
+    def clear_payment_confirmation(self):
+        """Reset the payment confirmation flag (e.g. on new action start or timeout)."""
+        self._payment_confirmed = False
 
 def calculate_extra_copies_price(base_price: float, num_copies: int) -> float:
     """
