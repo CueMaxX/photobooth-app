@@ -8,6 +8,7 @@ from .services.configuration import ConfigurationService
 from .services.gpio import GpioService
 from .services.information import InformationService
 from .services.logging import LoggingService
+from .services.payment import SumUpPaymentService
 from .services.pluginmanager import PluginManagerService
 from .services.processing import ProcessingService
 from .services.share import ShareService
@@ -29,6 +30,7 @@ class Container:
     share_service = ShareService()
     gpio_service = GpioService(processing_service, share_service, mediacollection_service)
     config_service = ConfigurationService(pluginmanager_service)
+    payment_service = SumUpPaymentService()
 
     _lock_startstop = Lock()
     _lock_reload = Lock()
