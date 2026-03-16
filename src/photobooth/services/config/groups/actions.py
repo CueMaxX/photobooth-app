@@ -295,6 +295,17 @@ class BaseConfigurationSet(BaseModel, Generic[t_JOBCONTROL, t_PROCESSING]):
         description="Name to identify, only used for display in admin center.",
     )
 
+    # --- Payment fields (only relevant when payment system is enabled) ---
+    price: float = Field(
+        default=0.0,
+        ge=0,
+        description="Price for this action in the configured currency (e.g. 3.00 for 3 EUR). Set to 0 for free actions.",
+    )
+    product_name: str = Field(
+        default="",
+        description="Product/service name sent to the SumUp terminal (e.g. 'Fotobox - Einzelfoto'). If empty, the action name is used as fallback.",
+    )
+
     jobcontrol: t_JOBCONTROL
     processing: t_PROCESSING
     trigger: Trigger
