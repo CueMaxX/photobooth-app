@@ -240,6 +240,37 @@ class SseEventIntervalInformationRecord(SseEventBase):
             )
         )
 
+@dataclass
+class SseEventPaymentState(SseEventBase):
+    """Payment status update sent to frontend during checkout lifecycle."""
+
+    state: str  # "pending", "success", "error", "cancelled", "timeout"
+    amount: float = 0.0
+    currency: str = "EUR"
+    description: str = ""
+    error_code: str = ""
+    error_message: str = ""
+    checkout_id: str = ""
+    transaction_id: str = ""
+
+    @property
+    def event(self) -> str:
+        return "PaymentState"
+
+    @property
+    def data(self) -> str:
+        return json.dumps(
+            dict(
+                state=self.state,
+                amount=self.amount,
+                currency=self.currency,
+                description=self.description,
+                error_code=self.error_code,
+                error_message=self.error_message,
+                checkout_id=self.checkout_id,
+                transaction_id=self.transaction_id,
+            )
+        )
 
 @dataclass
 class Client:
