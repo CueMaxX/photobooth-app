@@ -125,27 +125,6 @@ class SumUpPaymentService:
             logger.error(f"Network error creating reader checkout: {exc}")
             raise RuntimeError(f"Network error contacting SumUp API: {exc}") from exc
 
-    def get_reader_status(self) -> dict:
-        """
-        Get current reader status.
-
-        GET /v0.1/merchants/{mc}/readers/{rid}/status
-        """
-        url = f"{self._reader_base_url()}/status"
-
-        try:
-            response = requests.get(url, headers=self._get_headers(), timeout=REQUEST_TIMEOUT_SECONDS)
-            response.raise_for_status()
-            return response.json()
-        except requests.HTTPError as exc:
-            error_body = exc.response.text if exc.response is not None else "no response body"
-            status_code = exc.response.status_code if exc.response is not None else "unknown"
-            logger.error(f"SumUp API error getting reader status: {status_code} - {error_body}")
-            raise RuntimeError(f"SumUp reader status failed: {status_code} - {error_body}") from exc
-        except requests.RequestException as exc:
-            logger.warning(f"Network error getting reader status (will retry): {exc}")
-            raise
-
     def terminate_reader_checkout(self) -> None:
         """
         Terminate/cancel the current checkout on the reader.
@@ -166,17 +145,69 @@ class SumUpPaymentService:
         except Exception as exc:
             logger.warning(f"Failed to terminate reader checkout (best-effort): {exc}")
 
-    def poll_until_done(self, timeout: int) -> PaymentResult:
+    def find_transaction(self, client_transaction_id: str) -> dict | None:
         """
-        Poll the reader status until the transaction completes or timeout.
+        Find a transaction by client_transaction_id using the merchant-scoped endpoint.
 
-        The reader status endpoint returns the current screen/event on the reader.
-        We poll until we detect a terminal state (success or failure) or timeout.
+        GET /v2.1/merchants/{merchant_code}/transactions/history
+        This endpoint works for both sandbox and production accounts.
+        """
+        mc = self._get_merchant_code()
+        url = f"https://api.sumup.com/v2.1/merchants/{mc}/transactions/history"
+        params = {
+            "limit": 10,
+            "order": "descending",
+        }
+
+        try:
+            response = requests.get(url, headers=self._get_headers(), params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            data = response.json()
+
+            items = data.get("items", [])
+            logger.debug(f"Transaction history returned {len(items)} items")
+
+            for item in items:
+                item_client_tx_id = item.get("client_transaction_id", "")
+                item_tx_code = item.get("transaction_code", "")
+                item_id = str(item.get("id", ""))
+
+                if item_client_tx_id == client_transaction_id:
+                    logger.info(f"Found transaction by client_transaction_id: {item}")
+                    return item
+                if item_tx_code == client_transaction_id:
+                    logger.info(f"Found transaction by transaction_code: {item}")
+                    return item
+                if item_id == client_transaction_id:
+                    logger.info(f"Found transaction by id: {item}")
+                    return item
+
+            logger.debug(f"Transaction {client_transaction_id} not found in {len(items)} recent transactions")
+            return None
+
+        except requests.HTTPError as exc:
+            error_body = exc.response.text if exc.response is not None else "no response body"
+            status_code = exc.response.status_code if exc.response is not None else "unknown"
+            logger.warning(f"Error fetching transaction history: {status_code} - {error_body}")
+            return None
+        except Exception as exc:
+            logger.warning(f"Error fetching transaction history: {exc}")
+            return None
+
+    def poll_until_done(self, client_transaction_id: str, timeout: int) -> PaymentResult:
+        """
+        Poll for transaction completion using the Transactions API.
+
+        After the reader checkout is created, the Solo processes the payment.
+        We poll the transactions history to detect when the transaction completes.
         """
         elapsed = 0.0
-        last_status = ""
 
-        logger.info(f"Polling reader status (timeout={timeout}s)")
+        logger.info(f"Polling for transaction completion: client_tx_id={client_transaction_id}, timeout={timeout}s")
+
+        # Wait a short moment before first poll – the reader needs time to start
+        time.sleep(POLL_INTERVAL_SECONDS)
+        elapsed += POLL_INTERVAL_SECONDS
 
         while elapsed < timeout:
             if self._cancelled:
@@ -188,72 +219,36 @@ class SumUpPaymentService:
                     error_message="Payment cancelled by user.",
                 )
 
-            try:
-                status_data = self.get_reader_status()
-                logger.debug(f"Reader status: {status_data}")
+            # Try to find the transaction in history
+            tx = self.find_transaction(client_transaction_id)
 
-                # Parse the status response
-                # The response structure may contain event info about the checkout
-                status_str = str(status_data)
+            if tx is not None:
+                tx_status = tx.get("status", "").upper()
+                tx_id = str(tx.get("id", tx.get("transaction_id", "")))
+                tx_code = tx.get("transaction_code", "")
 
-                # Check for transaction completion events in the response
-                events = status_data.get("events", [])
-                if isinstance(events, list):
-                    for event in events:
-                        event_type = event.get("type", "") if isinstance(event, dict) else ""
-                        if event_type in ("checkout_success", "transaction_successful"):
-                            tx_id = ""
-                            event_data = event.get("data", {}) if isinstance(event, dict) else {}
-                            if isinstance(event_data, dict):
-                                tx_id = str(event_data.get("transaction_id", event_data.get("client_transaction_id", "")))
-                            logger.info(f"Payment successful! tx_id={tx_id}")
-                            return PaymentResult(
-                                success=True,
-                                status="PAID",
-                                transaction_id=tx_id or self._client_transaction_id,
-                            )
-                        elif event_type in ("checkout_failed", "transaction_failed"):
-                            error_msg = ""
-                            event_data = event.get("data", {}) if isinstance(event, dict) else {}
-                            if isinstance(event_data, dict):
-                                error_msg = str(event_data.get("message", "Transaction failed"))
-                            logger.warning(f"Payment failed: {error_msg}")
-                            return PaymentResult(
-                                success=False,
-                                status="FAILED",
-                                error_code="TRANSACTION_FAILED",
-                                error_message=error_msg,
-                            )
+                logger.info(f"Transaction found: status={tx_status}, id={tx_id}, code={tx_code}")
 
-                # Fallback: check top-level status/screen fields
-                current_status = status_data.get("status", "")
-                screen = status_data.get("screen", "")
-
-                # Detect idle after we were active – means transaction finished
-                if current_status and current_status != last_status:
-                    logger.debug(f"Reader status changed: {last_status} -> {current_status}")
-                    last_status = current_status
-
-                # If the reader reports a specific checkout result
-                checkout_status = status_data.get("checkout_status", "")
-                if checkout_status == "successful" or checkout_status == "paid":
-                    logger.info("Checkout reported as successful via status")
+                if tx_status in ("SUCCESSFUL", "PAID"):
                     return PaymentResult(
                         success=True,
                         status="PAID",
-                        transaction_id=self._client_transaction_id,
+                        transaction_id=tx_id,
+                        checkout_id=client_transaction_id,
                     )
-                elif checkout_status in ("failed", "expired", "declined"):
-                    logger.warning(f"Checkout reported as {checkout_status} via status")
+                elif tx_status in ("FAILED", "DECLINED", "EXPIRED", "CANCELLED"):
                     return PaymentResult(
                         success=False,
                         status="FAILED",
-                        error_code=checkout_status.upper(),
-                        error_message=f"Payment {checkout_status}",
+                        error_code=tx_status,
+                        error_message=f"Payment {tx_status.lower()}.",
+                        checkout_id=client_transaction_id,
                     )
-
-            except Exception as exc:
-                logger.warning(f"Error polling reader status (will retry): {exc}")
+                elif tx_status in ("PENDING", ""):
+                    # Still processing – continue polling
+                    logger.debug(f"Transaction still pending (elapsed={elapsed:.0f}s)")
+                else:
+                    logger.debug(f"Unknown transaction status '{tx_status}', continuing to poll")
 
             time.sleep(POLL_INTERVAL_SECONDS)
             elapsed += POLL_INTERVAL_SECONDS
@@ -305,7 +300,7 @@ class SumUpPaymentService:
 
         # Step 2: Poll for result
         try:
-            result = self.poll_until_done(timeout)
+            result = self.poll_until_done(self._client_transaction_id, timeout)
             result.amount = amount
             result.checkout_id = self._client_transaction_id
 
