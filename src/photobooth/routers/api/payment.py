@@ -72,6 +72,9 @@ def _run_payment_thread(amount: float, description: str):
 
     # Dispatch result event
     if result.success:
+        # Set confirmation flag so the next action/share call is allowed
+        container.payment_service.set_payment_confirmed()
+
         sse_service.dispatch_event(
             SseEventPaymentState(
                 state="success",
