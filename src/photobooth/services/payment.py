@@ -70,6 +70,9 @@ class SumUpPaymentService:
     def _get_affiliate_key(self) -> str:
         return appconfig.payment.sumup_affiliate_key
 
+    def _get_affiliate_app_id(self) -> str:
+        return appconfig.payment.sumup_affiliate_app_id
+
     def _reader_base_url(self) -> str:
         mc = self._get_merchant_code()
         rid = self._get_reader_id()
@@ -100,8 +103,9 @@ class SumUpPaymentService:
             payload["description"] = description
 
         affiliate_key = self._get_affiliate_key()
-        if affiliate_key:
-            payload["affiliate"] = {"key": affiliate_key}
+        affiliate_app_id = self._get_affiliate_app_id()
+        if affiliate_key and affiliate_app_id:
+            payload["affiliate"] = {"key": affiliate_key, "app_id": affiliate_app_id}
 
         logger.info(f"Creating reader checkout: amount={amount}, description='{description}'")
         logger.debug(f"Checkout payload: {payload}")
@@ -392,4 +396,3 @@ def calculate_extra_copies_price(base_price: float, num_copies: int) -> float:
             total += base_price * ec.bulk_above_price_percent / 100.0
 
     return round(total, 2)
-    

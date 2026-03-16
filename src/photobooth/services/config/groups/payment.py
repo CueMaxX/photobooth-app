@@ -93,6 +93,10 @@ class GroupPayment(BaseModel):
         default="",
         description="Affiliate Key for Cloud API checkout requests. Create one at https://developer.sumup.com under Affiliate Keys.",
     )
+    sumup_affiliate_app_id: str = Field(
+        default="",
+        description="Application ID associated with your Affiliate Key. Set this on the Affiliate Keys page at https://developer.sumup.com.",
+    )
 
     # --- Timeouts ---
 
