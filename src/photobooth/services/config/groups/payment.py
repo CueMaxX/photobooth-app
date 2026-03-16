@@ -89,6 +89,10 @@ class GroupPayment(BaseModel):
         default="",
         description="ID of the paired SumUp Solo card reader.",
     )
+    sumup_affiliate_key: str = Field(
+        default="",
+        description="Affiliate Key for Cloud API checkout requests. Create one at https://developer.sumup.com under Affiliate Keys.",
+    )
 
     # --- Timeouts ---
 

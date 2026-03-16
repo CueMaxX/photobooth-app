@@ -1,14 +1,12 @@
 """
-SumUp Cloud API payment service for terminal-based contactless payments.
+SumUp Cloud API payment service for Solo reader terminal payments.
 
-Provides a single high-level function request_payment() that handles the
-complete checkout lifecycle: create → send to reader → poll until result.
-Used for both initial action payments and extra copies payments.
+Uses the Cloud API endpoints:
+- POST /v0.1/merchants/{mc}/readers/{rid}/checkout  (start transaction on reader)
+- POST /v0.1/merchants/{mc}/readers/{rid}/terminate  (cancel transaction)
+- GET  /v0.1/merchants/{mc}/readers/{rid}/status      (poll reader status)
 
-Uses 'requests' (synchronous) since the processing workflow runs in a
-separate thread anyway. No async needed.
-
-SumUp API reference: https://developer.sumup.com/api
+SumUp Cloud API docs: https://developer.sumup.com/terminal-payments/cloud-api
 """
 
 import logging
@@ -47,18 +45,17 @@ class PaymentResult:
 
 
 class SumUpPaymentService:
-    """Encapsulates the SumUp Cloud API for terminal-based card payments."""
+    """Encapsulates the SumUp Cloud API for Solo reader terminal payments."""
 
     def __init__(self):
-        self._current_checkout_id: str | None = None
-        self._payment_confirmed: bool = False
+        self._active: bool = False
+        self._cancelled: bool = False
+        self._client_transaction_id: str = ""
 
     def _get_api_key(self) -> str:
-        """Retrieve the API key from config (SecretStr)."""
         return appconfig.payment.sumup_api_key.get_secret_value()
 
     def _get_headers(self) -> dict[str, str]:
-        """Build HTTP headers for SumUp API requests."""
         return {
             "Authorization": f"Bearer {self._get_api_key()}",
             "Content-Type": "application/json",
@@ -70,169 +67,230 @@ class SumUpPaymentService:
     def _get_reader_id(self) -> str:
         return appconfig.payment.sumup_reader_id
 
-    def create_checkout(self, amount: float, description: str, reference: str) -> dict:
-        """
-        Create a checkout at SumUp.
+    def _get_affiliate_key(self) -> str:
+        return appconfig.payment.sumup_affiliate_key
 
-        POST https://api.sumup.com/v0.1/checkouts
-        Returns the full checkout response dict including 'id'.
+    def _reader_base_url(self) -> str:
+        mc = self._get_merchant_code()
+        rid = self._get_reader_id()
+        return f"{SUMUP_API_BASE}/merchants/{mc}/readers/{rid}"
 
-        Raises:
-            RuntimeError: If the API call fails.
-        """
-        url = f"{SUMUP_API_BASE}/checkouts"
-        payload = {
-            "checkout_reference": reference,
-            "amount": round(amount, 2),
+    def _amount_to_minor_units(self, amount: float) -> dict:
+        """Convert a float amount (e.g. 3.00) to SumUp minor units format."""
+        value = round(amount * 100)
+        return {
             "currency": appconfig.payment.currency,
-            "description": description,
-            "merchant_code": self._get_merchant_code(),
+            "minor_unit": 2,
+            "value": value,
         }
 
-        logger.info(f"Creating SumUp checkout: amount={amount}, description='{description}', reference='{reference}'")
+    def create_reader_checkout(self, amount: float, description: str) -> dict:
+        """
+        Start a checkout on the paired Solo reader.
+
+        POST /v0.1/merchants/{mc}/readers/{rid}/checkout
+        Returns response dict with data.client_transaction_id.
+        """
+        url = f"{self._reader_base_url()}/checkout"
+        payload: dict = {
+            "total_amount": self._amount_to_minor_units(amount),
+        }
+
+        if description:
+            payload["description"] = description
+
+        affiliate_key = self._get_affiliate_key()
+        if affiliate_key:
+            payload["affiliate"] = {"key": affiliate_key}
+
+        logger.info(f"Creating reader checkout: amount={amount}, description='{description}'")
+        logger.debug(f"Checkout payload: {payload}")
 
         try:
             response = requests.post(url, headers=self._get_headers(), json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
             response.raise_for_status()
             data = response.json()
-            logger.info(f"Checkout created successfully: checkout_id={data.get('id')}")
+            logger.info(f"Reader checkout created: {data}")
             return data
         except requests.HTTPError as exc:
             error_body = exc.response.text if exc.response is not None else "no response body"
             status_code = exc.response.status_code if exc.response is not None else "unknown"
-            logger.error(f"SumUp API error creating checkout: {status_code} - {error_body}")
-            raise RuntimeError(f"SumUp checkout creation failed: {status_code} - {error_body}") from exc
+            logger.error(f"SumUp API error creating reader checkout: {status_code} - {error_body}")
+            raise RuntimeError(f"SumUp reader checkout failed: {status_code} - {error_body}") from exc
         except requests.RequestException as exc:
-            logger.error(f"Network error creating checkout: {exc}")
+            logger.error(f"Network error creating reader checkout: {exc}")
             raise RuntimeError(f"Network error contacting SumUp API: {exc}") from exc
 
-    def send_to_reader(self, checkout_id: str) -> dict:
+    def get_reader_status(self) -> dict:
         """
-        Send a checkout to the paired Solo reader for payment.
+        Get current reader status.
 
-        PUT https://api.sumup.com/v0.1/readers/{reader_id}/checkout
-        Returns the API response dict.
-
-        Raises:
-            RuntimeError: If the API call fails.
+        GET /v0.1/merchants/{mc}/readers/{rid}/status
         """
-        reader_id = self._get_reader_id()
-        url = f"{SUMUP_API_BASE}/readers/{reader_id}/checkout"
-        payload = {"checkout_id": checkout_id}
-
-        logger.info(f"Sending checkout {checkout_id} to reader {reader_id}")
+        url = f"{self._reader_base_url()}/status"
 
         try:
-            response = requests.put(url, headers=self._get_headers(), json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+            response = requests.get(url, headers=self._get_headers(), timeout=REQUEST_TIMEOUT_SECONDS)
             response.raise_for_status()
-            data = response.json()
-            logger.info("Checkout sent to reader successfully")
-            return data
+            return response.json()
         except requests.HTTPError as exc:
             error_body = exc.response.text if exc.response is not None else "no response body"
             status_code = exc.response.status_code if exc.response is not None else "unknown"
-            logger.error(f"SumUp API error sending to reader: {status_code} - {error_body}")
-            raise RuntimeError(f"SumUp send-to-reader failed: {status_code} - {error_body}") from exc
+            logger.error(f"SumUp API error getting reader status: {status_code} - {error_body}")
+            raise RuntimeError(f"SumUp reader status failed: {status_code} - {error_body}") from exc
         except requests.RequestException as exc:
-            logger.error(f"Network error sending to reader: {exc}")
-            raise RuntimeError(f"Network error contacting SumUp API: {exc}") from exc
+            logger.warning(f"Network error getting reader status (will retry): {exc}")
+            raise
 
-    def poll_checkout_status(self, checkout_id: str, timeout: int) -> dict:
+    def terminate_reader_checkout(self) -> None:
         """
-        Poll the checkout status until terminal (PAID/FAILED/EXPIRED) or timeout.
+        Terminate/cancel the current checkout on the reader.
 
-        GET https://api.sumup.com/v0.1/checkouts/{checkout_id}
-        Polls every POLL_INTERVAL_SECONDS seconds.
-
-        Returns:
-            The final checkout status response dict.
-
-        Raises:
-            TimeoutError: If the timeout is exceeded without a terminal status.
-            RuntimeError: If the API call fails.
+        POST /v0.1/merchants/{mc}/readers/{rid}/terminate
+        Best-effort – logs errors but does not raise.
         """
-        url = f"{SUMUP_API_BASE}/checkouts/{checkout_id}"
-        terminal_statuses = {"PAID", "FAILED", "EXPIRED"}
+        url = f"{self._reader_base_url()}/terminate"
+
+        logger.info("Terminating reader checkout")
+
+        try:
+            response = requests.post(url, headers=self._get_headers(), timeout=REQUEST_TIMEOUT_SECONDS)
+            if response.status_code < 300:
+                logger.info("Reader checkout terminated successfully")
+            else:
+                logger.warning(f"Terminate response: {response.status_code} - {response.text}")
+        except Exception as exc:
+            logger.warning(f"Failed to terminate reader checkout (best-effort): {exc}")
+
+    def poll_until_done(self, timeout: int) -> PaymentResult:
+        """
+        Poll the reader status until the transaction completes or timeout.
+
+        The reader status endpoint returns the current screen/event on the reader.
+        We poll until we detect a terminal state (success or failure) or timeout.
+        """
         elapsed = 0.0
+        last_status = ""
 
-        logger.info(f"Polling checkout {checkout_id} status (timeout={timeout}s)")
+        logger.info(f"Polling reader status (timeout={timeout}s)")
 
         while elapsed < timeout:
+            if self._cancelled:
+                logger.info("Payment was cancelled during polling")
+                return PaymentResult(
+                    success=False,
+                    status="CANCELLED",
+                    error_code="USER_CANCELLED",
+                    error_message="Payment cancelled by user.",
+                )
+
             try:
-                response = requests.get(url, headers=self._get_headers(), timeout=REQUEST_TIMEOUT_SECONDS)
-                response.raise_for_status()
-                data = response.json()
+                status_data = self.get_reader_status()
+                logger.debug(f"Reader status: {status_data}")
 
-                status = data.get("status", "UNKNOWN")
-                logger.debug(f"Checkout {checkout_id} status: {status} (elapsed={elapsed:.0f}s)")
+                # Parse the status response
+                # The response structure may contain event info about the checkout
+                status_str = str(status_data)
 
-                if status in terminal_statuses:
-                    logger.info(f"Checkout {checkout_id} reached terminal status: {status}")
-                    return data
+                # Check for transaction completion events in the response
+                events = status_data.get("events", [])
+                if isinstance(events, list):
+                    for event in events:
+                        event_type = event.get("type", "") if isinstance(event, dict) else ""
+                        if event_type in ("checkout_success", "transaction_successful"):
+                            tx_id = ""
+                            event_data = event.get("data", {}) if isinstance(event, dict) else {}
+                            if isinstance(event_data, dict):
+                                tx_id = str(event_data.get("transaction_id", event_data.get("client_transaction_id", "")))
+                            logger.info(f"Payment successful! tx_id={tx_id}")
+                            return PaymentResult(
+                                success=True,
+                                status="PAID",
+                                transaction_id=tx_id or self._client_transaction_id,
+                            )
+                        elif event_type in ("checkout_failed", "transaction_failed"):
+                            error_msg = ""
+                            event_data = event.get("data", {}) if isinstance(event, dict) else {}
+                            if isinstance(event_data, dict):
+                                error_msg = str(event_data.get("message", "Transaction failed"))
+                            logger.warning(f"Payment failed: {error_msg}")
+                            return PaymentResult(
+                                success=False,
+                                status="FAILED",
+                                error_code="TRANSACTION_FAILED",
+                                error_message=error_msg,
+                            )
 
-            except requests.HTTPError as exc:
-                error_body = exc.response.text if exc.response is not None else "no response body"
-                status_code = exc.response.status_code if exc.response is not None else "unknown"
-                logger.error(f"SumUp API error polling status: {status_code} - {error_body}")
-                raise RuntimeError(f"SumUp status poll failed: {status_code} - {error_body}") from exc
-            except requests.RequestException as exc:
-                # Network errors during polling are logged but retried
-                logger.warning(f"Network error polling status (will retry): {exc}")
+                # Fallback: check top-level status/screen fields
+                current_status = status_data.get("status", "")
+                screen = status_data.get("screen", "")
+
+                # Detect idle after we were active – means transaction finished
+                if current_status and current_status != last_status:
+                    logger.debug(f"Reader status changed: {last_status} -> {current_status}")
+                    last_status = current_status
+
+                # If the reader reports a specific checkout result
+                checkout_status = status_data.get("checkout_status", "")
+                if checkout_status == "successful" or checkout_status == "paid":
+                    logger.info("Checkout reported as successful via status")
+                    return PaymentResult(
+                        success=True,
+                        status="PAID",
+                        transaction_id=self._client_transaction_id,
+                    )
+                elif checkout_status in ("failed", "expired", "declined"):
+                    logger.warning(f"Checkout reported as {checkout_status} via status")
+                    return PaymentResult(
+                        success=False,
+                        status="FAILED",
+                        error_code=checkout_status.upper(),
+                        error_message=f"Payment {checkout_status}",
+                    )
+
+            except Exception as exc:
+                logger.warning(f"Error polling reader status (will retry): {exc}")
 
             time.sleep(POLL_INTERVAL_SECONDS)
             elapsed += POLL_INTERVAL_SECONDS
 
-        logger.warning(f"Checkout {checkout_id} timed out after {timeout}s")
-        raise TimeoutError(f"Payment timed out after {timeout} seconds")
-
-    def cancel_checkout(self, checkout_id: str) -> None:
-        """
-        Cancel / abort a pending checkout.
-
-        DELETE https://api.sumup.com/v0.1/checkouts/{checkout_id}
-        Logs errors but does not raise – cancellation is best-effort.
-        """
-        url = f"{SUMUP_API_BASE}/checkouts/{checkout_id}"
-
-        logger.info(f"Cancelling checkout {checkout_id}")
-
-        try:
-            response = requests.delete(url, headers=self._get_headers(), timeout=REQUEST_TIMEOUT_SECONDS)
-            if response.status_code < 300:
-                logger.info(f"Checkout {checkout_id} cancelled successfully")
-            else:
-                logger.warning(f"Cancel checkout response: {response.status_code} - {response.text}")
-        except Exception as exc:
-            logger.warning(f"Failed to cancel checkout {checkout_id} (best-effort): {exc}")
+        logger.warning(f"Payment timed out after {timeout}s")
+        return PaymentResult(
+            success=False,
+            status="TIMEOUT",
+            error_code="TIMEOUT",
+            error_message=f"No payment completed within {timeout} seconds.",
+        )
 
     def request_payment(self, amount: float, description: str, timeout: int | None = None) -> PaymentResult:
         """
-        High-level payment function: create checkout → send to reader → poll until result.
+        High-level payment function: create reader checkout → poll until result.
 
         This is the ONLY function the rest of the app should call.
-
-        Args:
-            amount: Amount to charge (in the configured currency).
-            description: Product/service description shown on the terminal.
-            timeout: Override for payment timeout (uses config default if None).
-
-        Returns:
-            PaymentResult with success status, transaction_id, error info, etc.
         """
         if timeout is None:
             timeout = appconfig.payment.payment_timeout_seconds
 
-        reference = f"pb-{uuid.uuid4().hex[:12]}"
+        self._active = True
+        self._cancelled = False
+        self._client_transaction_id = ""
 
         logger.info(f"=== Payment requested: {amount} {appconfig.payment.currency} for '{description}' ===")
 
-        # Step 1: Create checkout
+        # Step 1: Create checkout on reader
         try:
-            checkout_data = self.create_checkout(amount, description, reference)
-            checkout_id = checkout_data["id"]
-            self._current_checkout_id = checkout_id
+            checkout_data = self.create_reader_checkout(amount, description)
+
+            # Extract client_transaction_id from response
+            data = checkout_data.get("data", {})
+            if isinstance(data, dict):
+                self._client_transaction_id = data.get("client_transaction_id", "")
+
+            logger.info(f"Checkout started on reader, client_transaction_id={self._client_transaction_id}")
+
         except Exception as exc:
             logger.error(f"Payment failed at checkout creation: {exc}")
+            self._active = False
             return PaymentResult(
                 success=False,
                 status="ERROR",
@@ -241,86 +299,41 @@ class SumUpPaymentService:
                 amount=amount,
             )
 
-        # Step 2: Send to reader
+        # Step 2: Poll for result
         try:
-            self.send_to_reader(checkout_id)
-        except Exception as exc:
-            logger.error(f"Payment failed at send-to-reader: {exc}")
-            # Try to clean up the checkout
-            self.cancel_checkout(checkout_id)
-            self._current_checkout_id = None
-            return PaymentResult(
-                success=False,
-                status="ERROR",
-                error_code="SEND_TO_READER_FAILED",
-                error_message=str(exc),
-                amount=amount,
-                checkout_id=checkout_id,
-            )
+            result = self.poll_until_done(timeout)
+            result.amount = amount
+            result.checkout_id = self._client_transaction_id
 
-        # Step 3: Poll for result
-        try:
-            result_data = self.poll_checkout_status(checkout_id, timeout)
-            status = result_data.get("status", "UNKNOWN")
-            transaction_id = ""
-
-            # Extract transaction ID from completed checkout
-            transactions = result_data.get("transactions", [])
-            if transactions:
-                transaction_id = str(transactions[0].get("id", ""))
-
-            self._current_checkout_id = None
-
-            if status == "PAID":
-                logger.info(f"=== Payment successful: {amount} {appconfig.payment.currency}, tx={transaction_id} ===")
-                return PaymentResult(
-                    success=True,
-                    status="PAID",
-                    transaction_id=transaction_id,
-                    amount=amount,
-                    checkout_id=checkout_id,
-                )
+            if result.success:
+                logger.info(f"=== Payment successful: {amount} {appconfig.payment.currency} ===")
             else:
-                logger.warning(f"=== Payment not successful: status={status} ===")
-                return PaymentResult(
-                    success=False,
-                    status=status,
-                    error_code=status,
-                    error_message=f"Payment ended with status: {status}",
-                    amount=amount,
-                    checkout_id=checkout_id,
-                )
+                logger.warning(f"=== Payment ended: status={result.status} ===")
+                # Try to terminate if still pending
+                if result.status == "TIMEOUT":
+                    self.terminate_reader_checkout()
 
-        except TimeoutError:
-            logger.warning(f"=== Payment timed out after {timeout}s ===")
-            self.cancel_checkout(checkout_id)
-            self._current_checkout_id = None
-            return PaymentResult(
-                success=False,
-                status="TIMEOUT",
-                error_code="TIMEOUT",
-                error_message=f"No payment received within {timeout} seconds.",
-                amount=amount,
-                checkout_id=checkout_id,
-            )
+            return result
+
         except Exception as exc:
             logger.error(f"=== Payment failed during polling: {exc} ===")
-            self.cancel_checkout(checkout_id)
-            self._current_checkout_id = None
+            self.terminate_reader_checkout()
+            self._active = False
             return PaymentResult(
                 success=False,
                 status="ERROR",
                 error_code="POLL_FAILED",
                 error_message=str(exc),
                 amount=amount,
-                checkout_id=checkout_id,
             )
+        finally:
+            self._active = False
 
     def cancel_current(self) -> None:
         """Cancel the currently active checkout, if any."""
-        if self._current_checkout_id:
-            self.cancel_checkout(self._current_checkout_id)
-            self._current_checkout_id = None
+        if self._active:
+            self._cancelled = True
+            self.terminate_reader_checkout()
             logger.info("Current payment cancelled by user")
         else:
             logger.debug("No active checkout to cancel")
@@ -328,7 +341,11 @@ class SumUpPaymentService:
     @property
     def has_active_checkout(self) -> bool:
         """Check if there is a currently active (pending) checkout."""
-        return self._current_checkout_id is not None
+        return self._active
+
+    # --- Payment confirmation token (used by action/share guards) ---
+
+    _payment_confirmed: bool = False
 
     def set_payment_confirmed(self):
         """Mark that a payment was successfully completed. Used as a one-time token."""
@@ -336,8 +353,7 @@ class SumUpPaymentService:
         logger.info("Payment confirmation flag set")
 
     def consume_payment_confirmation(self) -> bool:
-        """Check and consume the payment confirmation (one-time use).
-        Returns True if a payment was confirmed, then resets the flag."""
+        """Check and consume the payment confirmation (one-time use)."""
         if self._payment_confirmed:
             self._payment_confirmed = False
             logger.info("Payment confirmation consumed")
@@ -346,12 +362,11 @@ class SumUpPaymentService:
 
     @property
     def is_payment_confirmed(self) -> bool:
-        """Check if a payment has been confirmed (without consuming it)."""
         return self._payment_confirmed
 
     def clear_payment_confirmation(self):
-        """Reset the payment confirmation flag (e.g. on new action start or timeout)."""
         self._payment_confirmed = False
+
 
 def calculate_extra_copies_price(base_price: float, num_copies: int) -> float:
     """
@@ -361,13 +376,6 @@ def calculate_extra_copies_price(base_price: float, num_copies: int) -> float:
     - 1st extra copy: base_price * price_percent / 100
     - 2nd to (bulk_threshold - 1) extra copies: base_price * bulk_price_percent / 100 each
     - From bulk_threshold onward: base_price * bulk_above_price_percent / 100 each
-
-    Args:
-        base_price: The original action price (e.g. 3.00 EUR).
-        num_copies: Number of extra copies requested (must be >= 1).
-
-    Returns:
-        Total price for all requested extra copies, rounded to 2 decimal places.
     """
     if num_copies <= 0:
         return 0.0
@@ -377,13 +385,10 @@ def calculate_extra_copies_price(base_price: float, num_copies: int) -> float:
 
     for i in range(1, num_copies + 1):
         if i == 1:
-            # First extra copy
             total += base_price * ec.price_percent / 100.0
         elif i < ec.bulk_threshold:
-            # Copies 2 up to (excluding) bulk_threshold
             total += base_price * ec.bulk_price_percent / 100.0
         else:
-            # From bulk_threshold onward
             total += base_price * ec.bulk_above_price_percent / 100.0
 
     return round(total, 2)
